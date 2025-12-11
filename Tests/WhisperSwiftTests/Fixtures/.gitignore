@@ -1,0 +1,6 @@
+# Whisper model files (large binary files)
+*.bin
+
+# Keep the sample audio files
+!jfk.wav
+!jfk.mp3

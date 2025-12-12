@@ -94,6 +94,21 @@ public enum AudioProcessor {
         return try convert(inputBuffer, sampleRate: inputSampleRate)
     }
     
+    // MARK: - Padding
+    
+    /// Minimum samples required for whisper.cpp (100ms at 16kHz).
+    public static let minimumSamples = 1600
+    
+    /// Pads audio samples to meet the minimum length required by whisper.cpp.
+    /// - Parameter samples: The input samples at 16kHz.
+    /// - Returns: Samples padded with silence to at least 100ms, or original if already long enough.
+    public static func padToMinimumLength(_ samples: [Float]) -> [Float] {
+        guard samples.count < minimumSamples else { return samples }
+        var padded = samples
+        padded.append(contentsOf: [Float](repeating: 0, count: minimumSamples - samples.count))
+        return padded
+    }
+    
     // MARK: - Resampling
     
     /// Simple linear interpolation resampling.

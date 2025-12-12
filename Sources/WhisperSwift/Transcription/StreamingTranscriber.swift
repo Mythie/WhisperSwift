@@ -364,7 +364,7 @@ public final class StreamingTranscriber: Sendable {
     
     /// Processes any remaining audio when stopping.
     private func processFinalAudio() async throws -> TranscriptionResult {
-        let samples = await audioBuffer.consumeAll()
+        var samples = await audioBuffer.consumeAll()
         
         guard !samples.isEmpty else {
             return TranscriptionResult(
@@ -373,6 +373,9 @@ public final class StreamingTranscriber: Sendable {
                 timings: nil
             )
         }
+        
+        // Pad to minimum length if needed (whisper.cpp requires >= 100ms)
+        samples = AudioProcessor.padToMinimumLength(samples)
         
         // Transcribe remaining audio
         let rawSegments = try await whisperContext.transcribe(

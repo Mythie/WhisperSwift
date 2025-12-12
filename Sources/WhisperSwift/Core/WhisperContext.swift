@@ -57,6 +57,10 @@ actor WhisperContext {
     
     // MARK: - Transcription
     
+    /// Minimum samples required for transcription (100ms at 16kHz).
+    /// whisper.cpp requires at least 100ms of audio input.
+    private static let minimumSamples = 1600
+    
     /// Performs full transcription on audio samples.
     /// - Parameters:
     ///   - samples: Audio samples as Float32 values (-1.0 to 1.0), must be 16kHz mono.
@@ -67,6 +71,12 @@ actor WhisperContext {
         samples: [Float],
         options: TranscriptionOptions
     ) throws -> [RawSegment] {
+        // whisper.cpp requires at least 100ms of audio
+        guard samples.count >= Self.minimumSamples else {
+            // Return empty result for audio that's too short
+            return []
+        }
+        
         var params = whisper_full_default_params(
             options.samplingStrategy.whisperStrategy
         )
@@ -81,6 +91,10 @@ actor WhisperContext {
         
         // Language handling - for non-multilingual models (e.g., tiny.en),
         // we must set language to "en" and disable detection
+        //
+        // Note: detect_language must be false for transcription to work.
+        // When detect_language is true, whisper.cpp only detects language and returns early.
+        // To auto-detect language AND transcribe, set language to "auto" with detect_language = false.
         let languagePtr: UnsafeMutablePointer<CChar>?
         if !isMultilingual {
             // English-only model - always use English
@@ -88,13 +102,17 @@ actor WhisperContext {
             params.language = UnsafePointer(languagePtr)
             params.detect_language = false
         } else if let language = options.language, language != .auto {
+            // Explicit language specified
             languagePtr = strdup(language.rawValue)
             params.language = UnsafePointer(languagePtr)
             params.detect_language = false
         } else {
-            languagePtr = nil
-            params.language = nil
-            params.detect_language = true
+            // Auto-detect language: set language to "auto" and detect_language to false
+            // whisper.cpp will auto-detect when language is "auto" or nil, and continue transcription
+            // when detect_language is false
+            languagePtr = strdup("auto")
+            params.language = UnsafePointer(languagePtr)
+            params.detect_language = false
         }
         defer { languagePtr?.deallocate() }
         

@@ -11,7 +11,7 @@ enum TestFixtures {
         Bundle.module.resourceURL!.appendingPathComponent("Fixtures")
     }
     
-    /// Path to the test model
+    /// Path to the test model (tiny.en - English only)
     static var modelPath: URL {
         fixturesURL.appendingPathComponent("ggml-tiny.en.bin")
     }
@@ -19,6 +19,16 @@ enum TestFixtures {
     /// Check if the test model exists
     static var hasModel: Bool {
         FileManager.default.fileExists(atPath: modelPath.path)
+    }
+    
+    /// Path to the large multilingual model (for language detection tests)
+    static var largeModelPath: URL {
+        fixturesURL.appendingPathComponent("ggml-large-v3-turbo-q8_0.bin")
+    }
+    
+    /// Check if the large model exists
+    static var hasLargeModel: Bool {
+        FileManager.default.fileExists(atPath: largeModelPath.path)
     }
     
     /// Path to JFK sample audio (in fixtures directory)
@@ -234,6 +244,113 @@ struct IntegrationTests {
         // Samples should be normalized
         let maxAbs = samples.map { abs($0) }.max() ?? 0
         #expect(maxAbs <= 1.0)
+    }
+}
+
+// MARK: - Large Model Tests (Multilingual)
+
+@Suite("Large Model Tests", .enabled(if: TestFixtures.hasLargeModel))
+struct LargeModelTests {
+    
+    @Test("Can load large model")
+    func loadLargeModel() async throws {
+        let transcriber = try await Transcriber(modelPath: TestFixtures.largeModelPath)
+        _ = transcriber
+    }
+    
+    @Test("Auto language detection works with nil language")
+    func autoDetectLanguageNil() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        let transcriber = try await Transcriber(modelPath: TestFixtures.largeModelPath)
+        // Use nil for language to trigger auto-detection
+        let options = TranscriptionOptions(language: nil)
+        let result = try await transcriber.transcribe(file: TestFixtures.jfkAudioPath, options: options)
+        
+        print("Auto-detect (nil) result:")
+        print("  Text: \(result.text)")
+        print("  Detected language: \(result.detectedLanguage?.displayName ?? "none")")
+        
+        #expect(!result.text.isEmpty, "Transcription should not be empty")
+        #expect(result.text.lowercased().contains("country") || result.text.lowercased().contains("ask"), 
+                "Transcription should contain expected words")
+        
+        // Should detect English
+        #expect(result.detectedLanguage == .english, 
+                "Should detect English, got: \(result.detectedLanguage?.displayName ?? "nil")")
+    }
+    
+    @Test("Auto language detection works with .auto language")
+    func autoDetectLanguageAuto() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        let transcriber = try await Transcriber(modelPath: TestFixtures.largeModelPath)
+        // Use .auto explicitly for auto-detection
+        let options = TranscriptionOptions(language: .auto)
+        let result = try await transcriber.transcribe(file: TestFixtures.jfkAudioPath, options: options)
+        
+        print("Auto-detect (.auto) result:")
+        print("  Text: \(result.text)")
+        print("  Detected language: \(result.detectedLanguage?.displayName ?? "none")")
+        
+        #expect(!result.text.isEmpty, "Transcription should not be empty")
+        #expect(result.text.lowercased().contains("country") || result.text.lowercased().contains("ask"), 
+                "Transcription should contain expected words")
+        
+        // Should detect English
+        #expect(result.detectedLanguage == .english, 
+                "Should detect English, got: \(result.detectedLanguage?.displayName ?? "nil")")
+    }
+    
+    @Test("Default options use auto-detection")
+    func defaultOptionsAutoDetect() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        let transcriber = try await Transcriber(modelPath: TestFixtures.largeModelPath)
+        // Use default options - should auto-detect
+        let result = try await transcriber.transcribe(file: TestFixtures.jfkAudioPath, options: .default)
+        
+        print("Default options result:")
+        print("  Text: \(result.text)")
+        print("  Detected language: \(result.detectedLanguage?.displayName ?? "none")")
+        
+        #expect(!result.text.isEmpty, "Transcription should not be empty")
+        
+        // Should detect English
+        #expect(result.detectedLanguage == .english, 
+                "Should detect English, got: \(result.detectedLanguage?.displayName ?? "nil")")
+    }
+    
+    @Test("Explicit language skips detection")
+    func explicitLanguageSkipsDetection() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        let transcriber = try await Transcriber(modelPath: TestFixtures.largeModelPath)
+        // Use explicit English
+        let options = TranscriptionOptions(language: .english)
+        let result = try await transcriber.transcribe(file: TestFixtures.jfkAudioPath, options: options)
+        
+        print("Explicit English result:")
+        print("  Text: \(result.text)")
+        print("  Detected language: \(result.detectedLanguage?.displayName ?? "none")")
+        
+        #expect(!result.text.isEmpty, "Transcription should not be empty")
+        
+        // When explicit language is set, detectedLanguage should be nil
+        #expect(result.detectedLanguage == nil, 
+                "Detected language should be nil when explicit language is set")
     }
 }
 

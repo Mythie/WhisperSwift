@@ -144,6 +144,7 @@ public final class StreamingTranscriber: Sendable {
         }
         
         await stateManager.setState(.running)
+        await stateManager.clearHistory()
         await audioBuffer.reset()
     }
     
@@ -290,7 +291,10 @@ public final class StreamingTranscriber: Sendable {
             // Emit each transcribed segment
             for rawSegment in rawSegments {
                 let transcriptionSegment = TranscriptionSegment(from: rawSegment)
-                segmentContinuation.yield(transcriptionSegment)
+                // Only emit if not a duplicate
+                if await stateManager.shouldEmit(text: transcriptionSegment.text) {
+                    segmentContinuation.yield(transcriptionSegment)
+                }
             }
         }
         
@@ -340,8 +344,9 @@ public final class StreamingTranscriber: Sendable {
             let chunkSamples = Array(samples[..<breakPoint])
             try await transcribeChunk(chunkSamples)
             
-            // Consume processed audio, keeping overlap for context
-            let overlapSamples = Int(0.5 * AudioProcessor.requiredSampleRate)
+            // Consume processed audio, keeping minimal overlap to avoid cutting words
+            // Reduced from 0.5s to 0.1s since we now have deduplication
+            let overlapSamples = Int(0.1 * AudioProcessor.requiredSampleRate)
             let consumeCount = max(0, breakPoint - overlapSamples)
             _ = await audioBuffer.consume(consumeCount)
         }
@@ -358,7 +363,10 @@ public final class StreamingTranscriber: Sendable {
         
         for rawSegment in rawSegments {
             let transcriptionSegment = TranscriptionSegment(from: rawSegment)
-            segmentContinuation.yield(transcriptionSegment)
+            // Only emit if not a duplicate
+            if await stateManager.shouldEmit(text: transcriptionSegment.text) {
+                segmentContinuation.yield(transcriptionSegment)
+            }
         }
     }
     
@@ -386,7 +394,10 @@ public final class StreamingTranscriber: Sendable {
         // Emit final segments
         for rawSegment in rawSegments {
             let transcriptionSegment = TranscriptionSegment(from: rawSegment)
-            segmentContinuation.yield(transcriptionSegment)
+            // Only emit if not a duplicate
+            if await stateManager.shouldEmit(text: transcriptionSegment.text) {
+                segmentContinuation.yield(transcriptionSegment)
+            }
         }
         
         // Get detected language
@@ -422,7 +433,91 @@ public final class StreamingTranscriber: Sendable {
 private actor StreamingStateManager {
     var state: StreamingState = .idle
     
+    /// Recently emitted text for deduplication (stores normalized text).
+    private var recentTexts: [String] = []
+    
+    /// Maximum number of recent texts to keep for deduplication.
+    private let maxRecentTexts = 10
+    
     func setState(_ newState: StreamingState) {
         state = newState
+        if newState == .idle || newState == .stopped {
+            recentTexts.removeAll()
+        }
+    }
+    
+    /// Checks if text is a duplicate and records it if not.
+    /// Returns true if the text should be emitted (not a duplicate).
+    func shouldEmit(text: String) -> Bool {
+        let normalized = Self.normalizeText(text)
+        
+        // Skip empty or whitespace-only text
+        guard !normalized.isEmpty else { return false }
+        
+        // Check if this text is a duplicate or substring of recent text
+        for recent in recentTexts {
+            // Exact match
+            if normalized == recent {
+                return false
+            }
+            // New text is contained within recent text (likely a partial re-transcription)
+            if recent.contains(normalized) {
+                return false
+            }
+            // Recent text is contained within new text - this could be an extension
+            // We allow this but will need to handle it specially
+        }
+        
+        // Check for significant overlap with recent texts
+        for recent in recentTexts {
+            if Self.hasSignificantOverlap(normalized, recent) {
+                return false
+            }
+        }
+        
+        // Not a duplicate - record and emit
+        recentTexts.append(normalized)
+        if recentTexts.count > maxRecentTexts {
+            recentTexts.removeFirst()
+        }
+        
+        return true
+    }
+    
+    /// Normalizes text for comparison by lowercasing and removing extra whitespace.
+    private static func normalizeText(_ text: String) -> String {
+        text.lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+    
+    /// Checks if two texts have significant overlap (>50% of words match in sequence).
+    private static func hasSignificantOverlap(_ text1: String, _ text2: String) -> Bool {
+        let words1 = text1.split(separator: " ")
+        let words2 = text2.split(separator: " ")
+        
+        guard words1.count >= 3 && words2.count >= 3 else { return false }
+        
+        // Check if the end of text2 matches the start of text1 (continuation overlap)
+        let checkLength = min(words1.count, words2.count, 5)
+        
+        // Check if last N words of text2 match first N words of text1
+        let endOfText2 = words2.suffix(checkLength)
+        let startOfText1 = words1.prefix(checkLength)
+        
+        var matchCount = 0
+        for (w1, w2) in zip(startOfText1, endOfText2) {
+            if w1 == w2 { matchCount += 1 }
+        }
+        
+        // If more than half match, it's likely an overlap
+        return matchCount > checkLength / 2
+    }
+    
+    /// Clears the recent texts history (useful when resetting).
+    func clearHistory() {
+        recentTexts.removeAll()
     }
 }

@@ -34,7 +34,7 @@ import AVFoundation
 ///
 /// - Note: You are responsible for managing the `AVAudioEngine` lifecycle (preparing, starting,
 ///   stopping). The transcriber only manages its tap on the input node.
-public final class BetaStreamingTranscriber: @unchecked Sendable {
+public final actor BetaStreamingTranscriber {
     
     // MARK: - Configuration
     
@@ -97,6 +97,9 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
     // MARK: - Properties
     
     /// The audio input node to read from.
+    private let engine: AVAudioEngine
+
+    /// The input node to read from.
     private let inputNode: AVAudioInputNode
     
     /// The whisper context for transcription.
@@ -138,12 +141,12 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
     public init(
         modelPath: URL,
         vadModelPath: URL? = nil,
-        input: AVAudioInputNode,
+        engine: AVAudioEngine,
         configuration: Configuration = .default
     ) async throws {
-        self.inputNode = input
+        self.engine = engine
         self.configuration = configuration
-        
+        self.inputNode = engine.inputNode
         // Initialize whisper context
         self.whisperContext = try await Task {
             try WhisperContext(
@@ -198,13 +201,14 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
         await stateManager.setState(.running)
         await stateManager.clearHistory()
         await audioBuffer.reset()
+
         
         // Get the input format and calculate buffer size based on hardware sample rate
-        let format = inputNode.outputFormat(forBus: 0)
+        let format = self.inputNode.outputFormat(forBus: 0)
         let bufferSize = AVAudioFrameCount(format.sampleRate * configuration.bufferDuration)
         
         // Install the tap
-        inputNode.installTap(
+        self.inputNode.installTap(
             onBus: 0,
             bufferSize: bufferSize,
             format: format
@@ -250,7 +254,7 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
         await stateManager.setState(.stopping)
         
         // Remove the tap
-        inputNode.removeTap(onBus: 0)
+        self.inputNode.removeTap(onBus: 0)
         
         // Cancel processing task
         await processingTaskHolder.cancel()

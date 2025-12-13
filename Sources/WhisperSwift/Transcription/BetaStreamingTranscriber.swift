@@ -34,7 +34,7 @@ import AVFoundation
 ///
 /// - Note: You are responsible for managing the `AVAudioEngine` lifecycle (preparing, starting,
 ///   stopping). The transcriber only manages its tap on the input node.
-public final actor BetaStreamingTranscriber {
+public final class BetaStreamingTranscriber: @unchecked Sendable {
     
     // MARK: - Configuration
     
@@ -219,7 +219,9 @@ public final actor BetaStreamingTranscriber {
             // AVAudioPCMBuffer is not Sendable, so we must extract the data here
             do {
                 let samples = try AudioProcessor.convert(buffer, sampleRate: format.sampleRate)
-                Task {
+                Task { [weak self] in
+                    guard let self = self else { return }
+                    
                     await self.appendSamples(samples)
                 }
             } catch {
@@ -232,6 +234,7 @@ public final actor BetaStreamingTranscriber {
             guard let self = self else { return }
             await self.processingLoop()
         }
+        
         await processingTaskHolder.setTask(task)
     }
     

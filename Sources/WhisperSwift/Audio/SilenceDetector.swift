@@ -1,6 +1,17 @@
 import Foundation
 import Accelerate
 
+/// Strategy for finding silence break points.
+public enum FindSilenceStrategy: Sendable {
+    /// Find the longest silence gap in the search window.
+    /// Better for accuracy but may increase latency.
+    case longest
+    
+    /// Find the most recent (closest to end) valid silence gap.
+    /// Better for real-time streaming with lower latency.
+    case mostRecent
+}
+
 /// Configuration for silence detection.
 public struct SilenceDetectorOptions: Sendable {
     /// RMS threshold below which audio is considered silence (0.0-1.0).
@@ -21,22 +32,29 @@ public struct SilenceDetectorOptions: Sendable {
     /// - Default: 0.01 seconds (10ms)
     public var windowDuration: TimeInterval
     
+    /// Strategy for finding silence break points.
+    /// - Default: `.mostRecent` for lower latency in streaming scenarios.
+    public var strategy: FindSilenceStrategy
+    
     /// Creates silence detector options.
     /// - Parameters:
     ///   - threshold: RMS threshold for silence. Defaults to 0.01.
     ///   - minSilenceDuration: Minimum silence duration. Defaults to 0.3s.
     ///   - searchDuration: How far back to search. Defaults to 5.0s.
     ///   - windowDuration: RMS window size. Defaults to 0.01s.
+    ///   - strategy: Strategy for finding silence. Defaults to `.mostRecent`.
     public init(
         threshold: Float = 0.01,
         minSilenceDuration: TimeInterval = 0.3,
         searchDuration: TimeInterval = 5.0,
-        windowDuration: TimeInterval = 0.01
+        windowDuration: TimeInterval = 0.01,
+        strategy: FindSilenceStrategy = .mostRecent
     ) {
         self.threshold = threshold
         self.minSilenceDuration = minSilenceDuration
         self.searchDuration = searchDuration
         self.windowDuration = windowDuration
+        self.strategy = strategy
     }
     
     /// Default silence detector options.
@@ -90,6 +108,10 @@ public enum SilenceDetector {
     /// Searches backwards from the end of the audio to find a silence gap
     /// that can be used as a natural split point for chunked transcription.
     ///
+    /// The search behavior depends on `options.strategy`:
+    /// - `.mostRecent`: Returns the first valid silence gap found (closest to end, lower latency)
+    /// - `.longest`: Searches the entire window and returns the longest silence gap
+    ///
     /// - Parameters:
     ///   - samples: Audio samples at 16kHz.
     ///   - options: Silence detection options.
@@ -127,10 +149,18 @@ public enum SilenceDetector {
             } else {
                 // Not silence - check if we found a good gap
                 if let silenceStart = currentSilenceStart,
-                   currentSilenceLength >= minSilenceSamples,
-                   currentSilenceLength > bestSilenceLength {
-                    bestSilenceStart = silenceStart
-                    bestSilenceLength = currentSilenceLength
+                   currentSilenceLength >= minSilenceSamples {
+                    
+                    // For .mostRecent strategy, return immediately on first valid gap
+                    if options.strategy == .mostRecent {
+                        return silenceStart - currentSilenceLength
+                    }
+                    
+                    // For .longest strategy, track the best one
+                    if currentSilenceLength > bestSilenceLength {
+                        bestSilenceStart = silenceStart
+                        bestSilenceLength = currentSilenceLength
+                    }
                 }
                 currentSilenceStart = nil
                 currentSilenceLength = 0
@@ -141,10 +171,18 @@ public enum SilenceDetector {
         
         // Check final run
         if let silenceStart = currentSilenceStart,
-           currentSilenceLength >= minSilenceSamples,
-           currentSilenceLength > bestSilenceLength {
-            bestSilenceStart = silenceStart
-            bestSilenceLength = currentSilenceLength
+           currentSilenceLength >= minSilenceSamples {
+            
+            // For .mostRecent, this is the last chance to return a valid gap
+            if options.strategy == .mostRecent {
+                return silenceStart - currentSilenceLength
+            }
+            
+            // For .longest, check if this is the best
+            if currentSilenceLength > bestSilenceLength {
+                bestSilenceStart = silenceStart
+                bestSilenceLength = currentSilenceLength
+            }
         }
         
         // Return the start of the silence (where speech ended)
@@ -157,18 +195,39 @@ public enum SilenceDetector {
     
     /// Detects whether the audio contains speech (non-silence).
     ///
+    /// Scans the audio in windows and returns `true` if *any* window exceeds
+    /// the threshold. This prevents missing speech when a buffer contains
+    /// mostly silence with a short speech segment.
+    ///
     /// - Parameters:
     ///   - samples: Audio samples at 16kHz.
     ///   - threshold: RMS threshold for silence. Defaults to 0.01.
-    /// - Returns: `true` if speech (audio above threshold) is detected.
+    ///   - windowDuration: Duration of each scanning window in seconds. Defaults to 0.1s (100ms).
+    /// - Returns: `true` if speech (audio above threshold) is detected in any window.
     public static func containsSpeech(
         in samples: [Float],
-        threshold: Float = 0.01
+        threshold: Float = 0.01,
+        windowDuration: TimeInterval = 0.1
     ) -> Bool {
         guard !samples.isEmpty else { return false }
         
-        let rms = calculateRMS(samples: samples, start: 0, count: samples.count)
-        return rms >= threshold
+        let windowSize = Int(windowDuration * sampleRate)
+        guard windowSize > 0 else { return false }
+        
+        // Check each window - return true if ANY window has speech
+        var i = 0
+        while i < samples.count {
+            let count = min(windowSize, samples.count - i)
+            let rms = calculateRMS(samples: samples, start: i, count: count)
+            
+            if rms >= threshold {
+                return true
+            }
+            
+            i += windowSize
+        }
+        
+        return false
     }
     
     /// Calculates the RMS (Root Mean Square) energy of audio samples.

@@ -584,6 +584,230 @@ struct StreamingTranscriberInitializationTests {
     }
 }
 
+// MARK: - StreamingStateManager Tests
+
+@Suite("StreamingStateManager")
+struct StreamingStateManagerTests {
+    
+    @Test("Initial state is idle")
+    func initialStateIsIdle() async {
+        let manager = StreamingStateManager()
+        let state = await manager.state
+        #expect(state == .idle)
+    }
+    
+    @Test("setState updates state")
+    func setStateUpdatesState() async {
+        let manager = StreamingStateManager()
+        
+        await manager.setState(.running)
+        var state = await manager.state
+        #expect(state == .running)
+        
+        await manager.setState(.stopping)
+        state = await manager.state
+        #expect(state == .stopping)
+        
+        await manager.setState(.stopped)
+        state = await manager.state
+        #expect(state == .stopped)
+    }
+    
+    @Test("shouldEmit returns false for empty text")
+    func shouldEmitFalseForEmptyText() async {
+        let manager = StreamingStateManager()
+        
+        let result1 = await manager.shouldEmit(text: "")
+        let result2 = await manager.shouldEmit(text: "   ")
+        let result3 = await manager.shouldEmit(text: "\n\t")
+        
+        #expect(result1 == false)
+        #expect(result2 == false)
+        #expect(result3 == false)
+    }
+    
+    @Test("shouldEmit returns true for new text")
+    func shouldEmitTrueForNewText() async {
+        let manager = StreamingStateManager()
+        
+        let result = await manager.shouldEmit(text: "Hello world")
+        #expect(result == true)
+    }
+    
+    @Test("shouldEmit returns false for duplicate text")
+    func shouldEmitFalseForDuplicate() async {
+        let manager = StreamingStateManager()
+        
+        _ = await manager.shouldEmit(text: "Hello world")
+        let result = await manager.shouldEmit(text: "Hello world")
+        
+        #expect(result == false)
+    }
+    
+    @Test("shouldEmit is case insensitive")
+    func shouldEmitCaseInsensitive() async {
+        let manager = StreamingStateManager()
+        
+        _ = await manager.shouldEmit(text: "Hello World")
+        let result = await manager.shouldEmit(text: "hello world")
+        
+        #expect(result == false)
+    }
+    
+    @Test("shouldEmit ignores extra whitespace")
+    func shouldEmitIgnoresWhitespace() async {
+        let manager = StreamingStateManager()
+        
+        _ = await manager.shouldEmit(text: "Hello world")
+        let result = await manager.shouldEmit(text: "  Hello   world  ")
+        
+        #expect(result == false)
+    }
+    
+    @Test("shouldEmit returns false for substring of recent text")
+    func shouldEmitFalseForSubstring() async {
+        let manager = StreamingStateManager()
+        
+        _ = await manager.shouldEmit(text: "Hello world how are you")
+        let result = await manager.shouldEmit(text: "Hello world")
+        
+        #expect(result == false)
+    }
+    
+    @Test("shouldEmit returns true for different text")
+    func shouldEmitTrueForDifferentText() async {
+        let manager = StreamingStateManager()
+        
+        _ = await manager.shouldEmit(text: "Hello world")
+        let result = await manager.shouldEmit(text: "Goodbye world")
+        
+        #expect(result == true)
+    }
+    
+    @Test("clearHistory allows duplicate after clearing")
+    func clearHistoryAllowsDuplicates() async {
+        let manager = StreamingStateManager()
+        
+        _ = await manager.shouldEmit(text: "Hello world")
+        await manager.clearHistory()
+        let result = await manager.shouldEmit(text: "Hello world")
+        
+        #expect(result == true)
+    }
+    
+    @Test("setState to idle clears history")
+    func setStateIdleClearsHistory() async {
+        let manager = StreamingStateManager()
+        
+        _ = await manager.shouldEmit(text: "Hello world")
+        await manager.setState(.idle)
+        let result = await manager.shouldEmit(text: "Hello world")
+        
+        #expect(result == true)
+    }
+    
+    @Test("setState to stopped clears history")
+    func setStateStoppedClearsHistory() async {
+        let manager = StreamingStateManager()
+        
+        _ = await manager.shouldEmit(text: "Hello world")
+        await manager.setState(.stopped)
+        let result = await manager.shouldEmit(text: "Hello world")
+        
+        #expect(result == true)
+    }
+    
+    @Test("normalizeText lowercases and trims")
+    func normalizeTextLowercasesAndTrims() {
+        let result = StreamingStateManager.normalizeText("  Hello WORLD  ")
+        #expect(result == "hello world")
+    }
+    
+    @Test("normalizeText collapses whitespace")
+    func normalizeTextCollapsesWhitespace() {
+        let result = StreamingStateManager.normalizeText("Hello   world\n\thow  are   you")
+        #expect(result == "hello world how are you")
+    }
+    
+    @Test("hasSignificantOverlap returns false for short texts")
+    func hasSignificantOverlapFalseForShortTexts() {
+        let result1 = StreamingStateManager.hasSignificantOverlap("hi", "hello")
+        let result2 = StreamingStateManager.hasSignificantOverlap("one two", "one two")
+        
+        #expect(result1 == false)
+        #expect(result2 == false)
+    }
+    
+    @Test("hasSignificantOverlap detects positional word match")
+    func hasSignificantOverlapDetectsPositionalMatch() {
+        // The algorithm compares end of text2 with start of text1 positionally
+        // If text2 = "A B C D E" and text1 = "A B C X Y", comparing:
+        //   endOfText2 = ["A", "B", "C", "D", "E"]
+        //   startOfText1 = ["A", "B", "C", "X", "Y"]
+        // 3 out of 5 match (>50%), so it's detected as overlap
+        let result = StreamingStateManager.hasSignificantOverlap(
+            "hello world how different words",  // starts with "hello world how"
+            "hello world how are you"           // ends with "hello world how are you"
+        )
+        #expect(result == true)
+    }
+    
+    @Test("hasSignificantOverlap returns false for no overlap")
+    func hasSignificantOverlapFalseForNoOverlap() {
+        let result = StreamingStateManager.hasSignificantOverlap(
+            "the quick brown fox",
+            "jumps over the lazy dog"
+        )
+        #expect(result == false)
+    }
+}
+
+// MARK: - BetaStreamingTranscriber Configuration Tests
+
+@Suite("BetaStreamingTranscriber Configuration")
+struct BetaStreamingTranscriberConfigurationTests {
+    
+    @Test("Default configuration has sensible values")
+    func defaultConfigurationValues() {
+        let config = BetaStreamingTranscriber.Configuration.default
+        
+        #expect(config.minAudioDuration == 1.0)
+        #expect(config.maxAudioDuration == 30.0)
+        #expect(config.bufferDuration == 0.1)
+    }
+    
+    @Test("Custom configuration preserves values")
+    func customConfigurationPreservesValues() {
+        let config = BetaStreamingTranscriber.Configuration(
+            transcriptionOptions: TranscriptionOptions(language: .english),
+            whisperConfiguration: .cpuOnly,
+            minAudioDuration: 2.0,
+            maxAudioDuration: 60.0,
+            bufferDuration: 0.2
+        )
+        
+        #expect(config.transcriptionOptions.language == .english)
+        #expect(config.whisperConfiguration.useGPU == false)
+        #expect(config.minAudioDuration == 2.0)
+        #expect(config.maxAudioDuration == 60.0)
+        #expect(config.bufferDuration == 0.2)
+    }
+    
+    @Test("Configuration includes nested options")
+    func configurationIncludesNestedOptions() {
+        let vadOptions = VADOptions(threshold: 0.7)
+        let silenceOptions = SilenceDetectorOptions(threshold: 0.02)
+        
+        let config = BetaStreamingTranscriber.Configuration(
+            vadOptions: vadOptions,
+            silenceDetectorOptions: silenceOptions
+        )
+        
+        #expect(config.vadOptions.threshold == 0.7)
+        #expect(config.silenceDetectorOptions.threshold == 0.02)
+    }
+}
+
 // MARK: - SilenceDetector Tests
 
 @Suite("SilenceDetector")

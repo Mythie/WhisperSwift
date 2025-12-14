@@ -31,6 +31,26 @@ enum TestFixtures {
         FileManager.default.fileExists(atPath: largeModelPath.path)
     }
     
+    /// Path to Silero VAD v5 model
+    static var vadV5ModelPath: URL {
+        fixturesURL.appendingPathComponent("ggml-silero-v5.1.2.bin")
+    }
+    
+    /// Check if VAD v5 model exists
+    static var hasVADv5Model: Bool {
+        FileManager.default.fileExists(atPath: vadV5ModelPath.path)
+    }
+    
+    /// Path to Silero VAD v6 model
+    static var vadV6ModelPath: URL {
+        fixturesURL.appendingPathComponent("ggml-silero-v6.2.0.bin")
+    }
+    
+    /// Check if VAD v6 model exists
+    static var hasVADv6Model: Bool {
+        FileManager.default.fileExists(atPath: vadV6ModelPath.path)
+    }
+    
     /// Path to JFK sample audio (in fixtures directory)
     static var jfkAudioPath: URL {
         fixturesURL.appendingPathComponent("jfk.wav")
@@ -402,5 +422,276 @@ struct PerformanceTests {
             let result = try await transcriber.transcribe(file: TestFixtures.jfkAudioPath, options: options)
             #expect(!result.text.isEmpty, "Transcription \(i) failed")
         }
+    }
+}
+
+// MARK: - VAD Tests (Silero v5)
+
+@Suite("VAD v5 Tests", .enabled(if: TestFixtures.hasVADv5Model && TestFixtures.hasModel))
+struct VADv5Tests {
+    
+    @Test("Can load Silero VAD v5 model")
+    func loadVADv5Model() async throws {
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV5ModelPath, useGPU: false)
+        _ = vad
+    }
+    
+    @Test("VAD v5 detects speech in JFK audio")
+    func vadV5DetectsSpeech() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV5ModelPath, useGPU: false)
+        let samples = try AudioProcessor.loadAudioFile(TestFixtures.jfkAudioPath)
+        
+        let hasSpeech = await vad.detectSpeech(samples: samples)
+        #expect(hasSpeech == true, "VAD v5 should detect speech in JFK audio")
+    }
+    
+    @Test("VAD v5 returns speech segments")
+    func vadV5GetsSpeechSegments() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV5ModelPath, useGPU: false)
+        let samples = try AudioProcessor.loadAudioFile(TestFixtures.jfkAudioPath)
+        
+        let segments = try await vad.getSpeechSegments(samples: samples, options: .default)
+        
+        #expect(!segments.isEmpty, "VAD v5 should return speech segments")
+        
+        // Check segment timing makes sense
+        for segment in segments {
+            #expect(segment.startTime >= 0, "Start time should be non-negative")
+            #expect(segment.endTime > segment.startTime, "End time should be after start time")
+            #expect(segment.duration > 0, "Duration should be positive")
+        }
+        
+        print("VAD v5 detected \(segments.count) speech segments:")
+        for (i, segment) in segments.enumerated() {
+            print("  Segment \(i + 1): \(String(format: "%.2f", segment.startTime))s - \(String(format: "%.2f", segment.endTime))s (duration: \(String(format: "%.2f", segment.duration))s)")
+        }
+    }
+    
+    @Test("VAD v5 returns no speech for silence")
+    func vadV5NoSpeechForSilence() async throws {
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV5ModelPath, useGPU: false)
+        
+        // Create 3 seconds of silence at 16kHz (longer duration for reliable detection)
+        let silentSamples = [Float](repeating: 0.0, count: 48000)
+        
+        // For very short silence, VAD may still return true due to initialization,
+        // so we check that probabilities are very low instead
+        let probabilities = await vad.getSpeechProbabilities(samples: silentSamples)
+        
+        if !probabilities.isEmpty {
+            let avgProb = probabilities.reduce(0, +) / Float(probabilities.count)
+            let maxProb = probabilities.max() ?? 0
+            print("VAD v5 silence - Avg probability: \(avgProb), Max: \(maxProb)")
+            #expect(avgProb < 0.3, "Average speech probability for silence should be low")
+        }
+    }
+    
+    @Test("VAD v5 returns speech probabilities")
+    func vadV5GetsProbabilities() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV5ModelPath, useGPU: false)
+        let samples = try AudioProcessor.loadAudioFile(TestFixtures.jfkAudioPath)
+        
+        let probabilities = await vad.getSpeechProbabilities(samples: samples)
+        
+        #expect(!probabilities.isEmpty, "VAD v5 should return probabilities")
+        
+        // Probabilities should be between 0 and 1
+        for prob in probabilities {
+            #expect(prob >= 0.0 && prob <= 1.0, "Probability should be between 0 and 1, got \(prob)")
+        }
+        
+        print("VAD v5 returned \(probabilities.count) probability values")
+        print("  Min: \(String(format: "%.3f", probabilities.min() ?? 0))")
+        print("  Max: \(String(format: "%.3f", probabilities.max() ?? 0))")
+        print("  Avg: \(String(format: "%.3f", probabilities.reduce(0, +) / Float(probabilities.count)))")
+    }
+    
+    // NOTE: StreamingTranscriber VAD integration tests are complex and require
+    // real-time audio streaming simulation. They are tested separately in manual
+    // integration tests with actual audio input devices.
+}
+
+// MARK: - VAD Tests (Silero v6)
+
+@Suite("VAD v6 Tests", .enabled(if: TestFixtures.hasVADv6Model && TestFixtures.hasModel))
+struct VADv6Tests {
+    
+    @Test("Can load Silero VAD v6 model")
+    func loadVADv6Model() async throws {
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV6ModelPath, useGPU: false)
+        _ = vad
+    }
+    
+    @Test("VAD v6 detects speech in JFK audio")
+    func vadV6DetectsSpeech() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV6ModelPath, useGPU: false)
+        let samples = try AudioProcessor.loadAudioFile(TestFixtures.jfkAudioPath)
+        
+        let hasSpeech = await vad.detectSpeech(samples: samples)
+        #expect(hasSpeech == true, "VAD v6 should detect speech in JFK audio")
+    }
+    
+    @Test("VAD v6 returns speech segments")
+    func vadV6GetsSpeechSegments() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV6ModelPath, useGPU: false)
+        let samples = try AudioProcessor.loadAudioFile(TestFixtures.jfkAudioPath)
+        
+        let segments = try await vad.getSpeechSegments(samples: samples, options: .default)
+        
+        #expect(!segments.isEmpty, "VAD v6 should return speech segments")
+        
+        // Check segment timing makes sense
+        for segment in segments {
+            #expect(segment.startTime >= 0, "Start time should be non-negative")
+            #expect(segment.endTime > segment.startTime, "End time should be after start time")
+            #expect(segment.duration > 0, "Duration should be positive")
+        }
+        
+        print("VAD v6 detected \(segments.count) speech segments:")
+        for (i, segment) in segments.enumerated() {
+            print("  Segment \(i + 1): \(String(format: "%.2f", segment.startTime))s - \(String(format: "%.2f", segment.endTime))s (duration: \(String(format: "%.2f", segment.duration))s)")
+        }
+    }
+    
+    @Test("VAD v6 returns no speech for silence")
+    func vadV6NoSpeechForSilence() async throws {
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV6ModelPath, useGPU: false)
+        
+        // Create 3 seconds of silence at 16kHz (longer duration for reliable detection)
+        let silentSamples = [Float](repeating: 0.0, count: 48000)
+        
+        // For very short silence, VAD may still return true due to initialization,
+        // so we check that probabilities are very low instead
+        let probabilities = await vad.getSpeechProbabilities(samples: silentSamples)
+        
+        if !probabilities.isEmpty {
+            let avgProb = probabilities.reduce(0, +) / Float(probabilities.count)
+            let maxProb = probabilities.max() ?? 0
+            print("VAD v6 silence - Avg probability: \(avgProb), Max: \(maxProb)")
+            #expect(avgProb < 0.3, "Average speech probability for silence should be low")
+        }
+    }
+    
+    @Test("VAD v6 returns speech probabilities")
+    func vadV6GetsProbabilities() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vad = try VADContext(modelPath: TestFixtures.vadV6ModelPath, useGPU: false)
+        let samples = try AudioProcessor.loadAudioFile(TestFixtures.jfkAudioPath)
+        
+        let probabilities = await vad.getSpeechProbabilities(samples: samples)
+        
+        #expect(!probabilities.isEmpty, "VAD v6 should return probabilities")
+        
+        // Probabilities should be between 0 and 1
+        for prob in probabilities {
+            #expect(prob >= 0.0 && prob <= 1.0, "Probability should be between 0 and 1, got \(prob)")
+        }
+        
+        print("VAD v6 returned \(probabilities.count) probability values")
+        print("  Min: \(String(format: "%.3f", probabilities.min() ?? 0))")
+        print("  Max: \(String(format: "%.3f", probabilities.max() ?? 0))")
+        print("  Avg: \(String(format: "%.3f", probabilities.reduce(0, +) / Float(probabilities.count)))")
+    }
+    
+    // NOTE: StreamingTranscriber VAD integration tests are complex and require
+    // real-time audio streaming simulation. They are tested separately in manual
+    // integration tests with actual audio input devices.
+}
+
+// MARK: - VAD Comparison Tests
+
+@Suite("VAD Comparison Tests", .enabled(if: TestFixtures.hasVADv5Model && TestFixtures.hasVADv6Model && TestFixtures.hasModel))
+struct VADComparisonTests {
+    
+    @Test("Both VAD versions detect speech in same audio")
+    func bothVersionsDetectSpeech() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vadV5 = try VADContext(modelPath: TestFixtures.vadV5ModelPath, useGPU: false)
+        let vadV6 = try VADContext(modelPath: TestFixtures.vadV6ModelPath, useGPU: false)
+        let samples = try AudioProcessor.loadAudioFile(TestFixtures.jfkAudioPath)
+        
+        let hasSpeechV5 = await vadV5.detectSpeech(samples: samples)
+        let hasSpeechV6 = await vadV6.detectSpeech(samples: samples)
+        
+        #expect(hasSpeechV5 == true, "VAD v5 should detect speech")
+        #expect(hasSpeechV6 == true, "VAD v6 should detect speech")
+    }
+    
+    @Test("Both VAD versions return similar segment counts")
+    func bothVersionsReturnSimilarSegments() async throws {
+        guard TestFixtures.hasJFKAudio else {
+            Issue.record("JFK audio not found")
+            return
+        }
+        
+        // Use CPU-only to avoid Metal backend issues with VAD
+        let vadV5 = try VADContext(modelPath: TestFixtures.vadV5ModelPath, useGPU: false)
+        let vadV6 = try VADContext(modelPath: TestFixtures.vadV6ModelPath, useGPU: false)
+        let samples = try AudioProcessor.loadAudioFile(TestFixtures.jfkAudioPath)
+        
+        let segmentsV5 = try await vadV5.getSpeechSegments(samples: samples, options: .default)
+        let segmentsV6 = try await vadV6.getSpeechSegments(samples: samples, options: .default)
+        
+        print("VAD v5 segments: \(segmentsV5.count)")
+        print("VAD v6 segments: \(segmentsV6.count)")
+        
+        // Both should find at least one segment
+        #expect(!segmentsV5.isEmpty, "VAD v5 should find segments")
+        #expect(!segmentsV6.isEmpty, "VAD v6 should find segments")
+        
+        // Calculate total speech duration for each
+        let totalDurationV5 = segmentsV5.reduce(0) { $0 + $1.duration }
+        let totalDurationV6 = segmentsV6.reduce(0) { $0 + $1.duration }
+        
+        print("VAD v5 total speech duration: \(String(format: "%.2f", totalDurationV5))s")
+        print("VAD v6 total speech duration: \(String(format: "%.2f", totalDurationV6))s")
+        
+        // Total durations should be somewhat similar (within 50% of each other)
+        let ratio = max(totalDurationV5, totalDurationV6) / max(min(totalDurationV5, totalDurationV6), 0.1)
+        #expect(ratio < 2.0, "VAD versions should have similar total speech durations (ratio: \(ratio))")
     }
 }

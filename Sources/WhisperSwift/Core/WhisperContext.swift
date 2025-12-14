@@ -134,6 +134,13 @@ actor WhisperContext {
             params.beam_search.beam_size = Int32(beamSize)
         }
         
+        // Streaming-related options
+        params.single_segment = options.singleSegment
+        params.no_timestamps = options.noTimestamps
+        if options.maxTokens > 0 {
+            params.n_max_text_ctx = Int32(options.maxTokens)
+        }
+        
         // Run transcription
         whisper_reset_timings(context)
         

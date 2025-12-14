@@ -100,6 +100,46 @@ audioEngine.stop()
 let finalResult = try await transcriber.stop()
 ```
 
+### Low-Latency Streaming (Beta)
+
+For continuous speech like lectures or live captioning, use `BetaStreamingTranscriber` which provides sliding window transcription matching the whisper.cpp stream example:
+
+```swift
+import WhisperSwift
+import AVFoundation
+
+// Create audio engine - you manage its lifecycle
+let engine = AVAudioEngine()
+
+// Create the beta streaming transcriber
+let transcriber = try await BetaStreamingTranscriber(
+    modelPath: modelURL,
+    engine: engine,
+    configuration: .lowLatency  // or .default for balanced latency/accuracy
+)
+
+// Start audio engine first
+try engine.start()
+
+// Start transcription
+try await transcriber.start()
+
+// Receive segments as they arrive
+for try await segment in transcriber.segments {
+    print(segment.text)        // Transcribed text
+    print(segment.isPartial)   // true = may be updated, false = final
+}
+
+// Stop and get final text
+let finalText = try await transcriber.stop()
+engine.stop()
+```
+
+**Configuration presets:**
+- `.default` - 3s step, 10s window (matches whisper.cpp)
+- `.lowLatency` - 1s step, 5s window (faster response)
+- `.vadMode` - Use with `vadModelPath` for speech-triggered transcription
+
 ## Configuration
 
 ### Transcription Options

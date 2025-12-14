@@ -767,44 +767,84 @@ struct StreamingStateManagerTests {
 @Suite("BetaStreamingTranscriber Configuration")
 struct BetaStreamingTranscriberConfigurationTests {
     
-    @Test("Default configuration has sensible values")
+    @Test("Default configuration matches whisper.cpp stream defaults")
     func defaultConfigurationValues() {
         let config = BetaStreamingTranscriber.Configuration.default
         
-        #expect(config.minAudioDuration == 1.0)
-        #expect(config.maxAudioDuration == 30.0)
+        // Matches whisper.cpp stream example defaults
+        #expect(config.stepDuration == 3.0)
+        #expect(config.windowDuration == 10.0)
+        #expect(config.keepDuration == 0.2)
+        #expect(config.keepContext == false)
         #expect(config.bufferDuration == 0.1)
+        #expect(config.maxTokens == 32)
     }
     
     @Test("Custom configuration preserves values")
     func customConfigurationPreservesValues() {
         let config = BetaStreamingTranscriber.Configuration(
+            stepDuration: 1.0,
+            windowDuration: 5.0,
+            keepDuration: 0.5,
             transcriptionOptions: TranscriptionOptions(language: .english),
             whisperConfiguration: .cpuOnly,
-            minAudioDuration: 2.0,
-            maxAudioDuration: 60.0,
-            bufferDuration: 0.2
+            keepContext: true,
+            vadOptions: VADOptions(threshold: 0.8),
+            bufferDuration: 0.05,
+            maxTokens: 16
         )
         
+        #expect(config.stepDuration == 1.0)
+        #expect(config.windowDuration == 5.0)
+        #expect(config.keepDuration == 0.5)
         #expect(config.transcriptionOptions.language == .english)
         #expect(config.whisperConfiguration.useGPU == false)
-        #expect(config.minAudioDuration == 2.0)
-        #expect(config.maxAudioDuration == 60.0)
-        #expect(config.bufferDuration == 0.2)
+        #expect(config.keepContext == true)
+        #expect(config.vadOptions.threshold == 0.8)
+        #expect(config.bufferDuration == 0.05)
+        #expect(config.maxTokens == 16)
     }
     
-    @Test("Configuration includes nested options")
-    func configurationIncludesNestedOptions() {
-        let vadOptions = VADOptions(threshold: 0.7)
-        let silenceOptions = SilenceDetectorOptions(threshold: 0.02)
+    @Test("Low latency preset has expected values")
+    func lowLatencyPreset() {
+        let config = BetaStreamingTranscriber.Configuration.lowLatency
         
+        #expect(config.stepDuration == 1.0)
+        #expect(config.windowDuration == 5.0)
+        #expect(config.bufferDuration == 0.05)
+        #expect(config.maxTokens == 16)
+    }
+    
+    @Test("VAD mode preset has expected values")
+    func vadModePreset() {
+        let config = BetaStreamingTranscriber.Configuration.vadMode
+        
+        // VAD mode is enabled by providing a vadModelPath to the transcriber init
+        // The preset just sets appropriate defaults for VAD operation
+        #expect(config.keepDuration == 0.0)
+        #expect(config.maxTokens == 0)
+    }
+    
+    @Test("Window duration cannot be less than step duration")
+    func windowDurationConstraint() {
         let config = BetaStreamingTranscriber.Configuration(
-            vadOptions: vadOptions,
-            silenceDetectorOptions: silenceOptions
+            stepDuration: 5.0,
+            windowDuration: 3.0  // Less than step duration
         )
         
-        #expect(config.vadOptions.threshold == 0.7)
-        #expect(config.silenceDetectorOptions.threshold == 0.02)
+        // Window should be clamped to at least step duration
+        #expect(config.windowDuration >= config.stepDuration)
+    }
+    
+    @Test("Keep duration cannot exceed step duration")
+    func keepDurationConstraint() {
+        let config = BetaStreamingTranscriber.Configuration(
+            stepDuration: 1.0,
+            keepDuration: 2.0  // Greater than step duration
+        )
+        
+        // Keep should be clamped to at most step duration
+        #expect(config.keepDuration <= config.stepDuration)
     }
 }
 

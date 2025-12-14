@@ -44,10 +44,10 @@ actor VADContext {
     /// Creates a new VAD context from a model file.
     /// - Parameters:
     ///   - modelPath: Path to the Silero VAD GGML model file.
-    ///   - useGPU: Whether to use GPU acceleration. Defaults to true.
+    ///   - useGPU: Whether to use GPU acceleration. Defaults to false.
     ///   - threadCount: Number of threads to use. Defaults to 4.
     /// - Throws: `WhisperError.vadFailed` if the model cannot be loaded.
-    init(modelPath: URL, useGPU: Bool = true, threadCount: Int = 4) throws {
+    init(modelPath: URL, useGPU: Bool = false, threadCount: Int = 4) throws {
         guard FileManager.default.fileExists(atPath: modelPath.path) else {
             throw WhisperError.vadFailed("VAD model not found at: \(modelPath.path)")
         }

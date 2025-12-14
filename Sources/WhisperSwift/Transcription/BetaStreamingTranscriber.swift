@@ -1,19 +1,24 @@
 import Foundation
 import AVFoundation
 
-/// A streaming transcriber that automatically handles audio input from an AVAudioInputNode.
+/// A streaming transcriber that works like the whisper.cpp stream example.
 ///
-/// This is a higher-level API compared to `StreamingTranscriber` - you provide the input node
-/// and the transcriber handles installing taps, audio conversion, and buffer management.
+/// This transcriber uses a sliding window approach with overlap to provide
+/// real-time transcription with smooth output. It supports two modes:
+///
+/// 1. **Sliding Window Mode** (default): Continuously processes audio in overlapping
+///    windows, providing low-latency incremental output.
+///
+/// 2. **VAD Mode**: Uses voice activity detection to transcribe complete utterances,
+///    providing higher quality output at the cost of latency.
 ///
 /// **Example Usage:**
 /// ```swift
 /// let engine = AVAudioEngine()
-/// let input = engine.inputNode
 ///
 /// let transcriber = try await BetaStreamingTranscriber(
 ///     modelPath: modelURL,
-///     input: input
+///     engine: engine
 /// )
 ///
 /// // Start the audio engine
@@ -29,102 +34,161 @@ import AVFoundation
 ///
 /// // Or stop manually and get the final result
 /// let finalResult = try await transcriber.stop()
-/// print(finalResult.text)
 /// ```
 ///
-/// - Note: You are responsible for managing the `AVAudioEngine` lifecycle (preparing, starting,
-///   stopping). The transcriber only manages its tap on the input node.
+/// - Note: You are responsible for managing the `AVAudioEngine` lifecycle.
 public final class BetaStreamingTranscriber: @unchecked Sendable {
     
     // MARK: - Configuration
     
     /// Configuration options for the streaming transcriber.
     public struct Configuration: Sendable {
+        /// Audio step size - how much NEW audio to process each iteration (in seconds).
+        /// Smaller = more responsive but more CPU usage.
+        /// Default: 3.0 seconds (matches whisper.cpp stream example)
+        public var stepDuration: TimeInterval
+        
+        /// Total audio window length for each transcription (in seconds).
+        /// This is the total context window passed to whisper.
+        /// Default: 10.0 seconds (matches whisper.cpp stream example)
+        public var windowDuration: TimeInterval
+        
+        /// Audio to keep from previous iteration to avoid word boundary issues (in seconds).
+        /// This overlap helps maintain continuity between transcriptions.
+        /// Default: 0.2 seconds (200ms, matches whisper.cpp stream example)
+        public var keepDuration: TimeInterval
+        
         /// Transcription options (language, sampling strategy, etc.).
         public var transcriptionOptions: TranscriptionOptions
         
         /// Hardware configuration (GPU, threads, etc.).
         public var whisperConfiguration: WhisperConfiguration
         
-        /// VAD options (only used if VAD model is provided).
+        /// Whether to keep context (prompt tokens) between transcriptions.
+        /// When true, uses output from previous transcription as prompt for next.
+        /// This can improve accuracy but may cause hallucinations if context drifts.
+        /// Default: false (matches whisper.cpp stream example)
+        public var keepContext: Bool
+        
+        /// VAD options for neural voice activity detection.
+        /// Only used when a VAD model path is provided to the transcriber.
         public var vadOptions: VADOptions
         
-        /// Silence detector options (used when no VAD model is provided).
-        public var silenceDetectorOptions: SilenceDetectorOptions
-        
-        /// Minimum audio duration before attempting transcription.
-        public var minAudioDuration: TimeInterval
-        
-        /// Maximum audio duration before forcing transcription.
-        public var maxAudioDuration: TimeInterval
-        
         /// Duration of each audio buffer callback (in seconds).
-        /// This is converted to frames based on the hardware sample rate.
-        /// Smaller values = lower latency but more CPU overhead.
-        /// Larger values = higher latency but more efficient.
+        /// This affects how often the audio callback fires.
+        /// Smaller = more responsive but more overhead.
+        /// Default: 0.1 seconds (100ms)
         public var bufferDuration: TimeInterval
         
-        /// Default configuration.
+        /// Maximum tokens per audio chunk.
+        /// Set to 0 for no limit (whisper will decide based on audio length).
+        /// Default: 32 (matches whisper.cpp stream example)
+        public var maxTokens: Int
+        
+        /// Default configuration for real-time streaming.
         public static let `default` = Configuration(
+            stepDuration: 3.0,
+            windowDuration: 10.0,
+            keepDuration: 0.2,
+            transcriptionOptions: .init(language: .english), // English for speed
+            whisperConfiguration: .default,
+            keepContext: false,
+            vadOptions: .default,
+            bufferDuration: 0.1,
+            maxTokens: 32
+        )
+        
+        /// Configuration optimized for low latency.
+        public static let lowLatency = Configuration(
+            stepDuration: 1.0,
+            windowDuration: 5.0,
+            keepDuration: 0.2,
+            transcriptionOptions: .init(language: .english),
+            whisperConfiguration: .default,
+            keepContext: false,
+            vadOptions: .default,
+            bufferDuration: 0.05,
+            maxTokens: 16
+        )
+        
+        /// Configuration for VAD mode - waits for speech, then transcribes complete utterances.
+        /// Requires a VAD model path to be provided when initializing the transcriber.
+        public static let vadMode = Configuration(
+            stepDuration: 3.0,
+            windowDuration: 10.0,
+            keepDuration: 0.0, // Not used in VAD mode
             transcriptionOptions: .default,
             whisperConfiguration: .default,
+            keepContext: false,
             vadOptions: .default,
-            silenceDetectorOptions: .default,
-            minAudioDuration: 1.0,
-            maxAudioDuration: 30.0,
-            bufferDuration: 0.1 // 100ms
+            bufferDuration: 0.1,
+            maxTokens: 0
         )
         
         public init(
-            transcriptionOptions: TranscriptionOptions = .default,
+            stepDuration: TimeInterval = 3.0,
+            windowDuration: TimeInterval = 10.0,
+            keepDuration: TimeInterval = 0.2,
+            transcriptionOptions: TranscriptionOptions = .init(language: .english),
             whisperConfiguration: WhisperConfiguration = .default,
+            keepContext: Bool = false,
             vadOptions: VADOptions = .default,
-            silenceDetectorOptions: SilenceDetectorOptions = .default,
-            minAudioDuration: TimeInterval = 1.0,
-            maxAudioDuration: TimeInterval = 30.0,
-            bufferDuration: TimeInterval = 0.1
+            bufferDuration: TimeInterval = 0.1,
+            maxTokens: Int = 32
         ) {
+            self.stepDuration = stepDuration
+            self.windowDuration = max(windowDuration, stepDuration)
+            self.keepDuration = min(keepDuration, stepDuration)
             self.transcriptionOptions = transcriptionOptions
             self.whisperConfiguration = whisperConfiguration
+            self.keepContext = keepContext
             self.vadOptions = vadOptions
-            self.silenceDetectorOptions = silenceDetectorOptions
-            self.minAudioDuration = minAudioDuration
-            self.maxAudioDuration = maxAudioDuration
             self.bufferDuration = bufferDuration
+            self.maxTokens = maxTokens
         }
+    }
+    
+    // MARK: - Streaming Segment
+    
+    /// A segment emitted during streaming transcription.
+    public struct StreamingSegment: Sendable {
+        /// The transcribed text.
+        public let text: String
+        
+        /// Whether this is a partial (in-progress) or final segment.
+        /// Partial segments may be updated or replaced by subsequent segments.
+        public let isPartial: Bool
+        
+        /// The iteration number this segment came from.
+        public let iteration: Int
     }
     
     // MARK: - Properties
     
-    /// The audio input node to read from.
+    /// The audio engine.
     private let engine: AVAudioEngine
-
+    
     /// The input node to read from.
     private let inputNode: AVAudioInputNode
     
     /// The whisper context for transcription.
     private let whisperContext: WhisperContext
     
-    /// The VAD context for speech detection (optional).
+    /// The VAD context for neural speech detection (optional).
+    /// When provided, enables VAD mode for speech-triggered transcription.
     private let vadContext: VADContext?
-    
-    /// The audio buffer for accumulating samples.
-    private let audioBuffer: AudioRingBuffer
-    
-    /// Internal state manager.
-    private let stateManager: StreamingStateManager
     
     /// Configuration for this transcriber.
     private let configuration: Configuration
     
     /// The stream continuation for emitting segments.
-    private let segmentContinuation: AsyncThrowingStream<TranscriptionSegment, Error>.Continuation
+    private let segmentContinuation: AsyncThrowingStream<StreamingSegment, Error>.Continuation
     
     /// The public async stream of transcribed segments.
-    public let segments: AsyncThrowingStream<TranscriptionSegment, Error>
+    public let segments: AsyncThrowingStream<StreamingSegment, Error>
     
-    /// Processing task handle.
-    private let processingTaskHolder: ProcessingTaskHolder
+    /// Processing state actor.
+    private let state: BetaStreamingState
     
     // MARK: - Initialization
     
@@ -132,21 +196,22 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
     ///
     /// - Parameters:
     ///   - modelPath: Path to the whisper.cpp GGML model file.
+    ///   - engine: The audio engine to use.
     ///   - vadModelPath: Optional path to the Silero VAD model file.
-    ///     If provided, neural VAD will be used for speech detection.
-    ///     If nil, lightweight RMS-based silence detection is used instead.
-    ///   - input: The audio input node to read from.
+    ///     When provided, enables VAD mode for speech-triggered transcription.
+    ///     Download from: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-silero-vad.bin
     ///   - configuration: Configuration options for the transcriber.
     /// - Throws: `WhisperError.modelNotFound` or `WhisperError.modelLoadFailed`
     public init(
         modelPath: URL,
-        vadModelPath: URL? = nil,
         engine: AVAudioEngine,
+        vadModelPath: URL? = nil,
         configuration: Configuration = .default
     ) async throws {
         self.engine = engine
         self.configuration = configuration
         self.inputNode = engine.inputNode
+        
         // Initialize whisper context
         self.whisperContext = try await Task {
             try WhisperContext(
@@ -156,11 +221,12 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
         }.value
         
         // Initialize VAD context if model path provided
+        // Note: VAD currently crashes with Metal, so we force CPU-only
         if let vadPath = vadModelPath {
             self.vadContext = try await Task {
                 try VADContext(
                     modelPath: vadPath,
-                    useGPU: configuration.whisperConfiguration.useGPU,
+                    useGPU: false,  // Force CPU - Metal crashes with VAD
                     threadCount: Int(configuration.whisperConfiguration.optimalThreadCount)
                 )
             }.value
@@ -168,13 +234,11 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
             self.vadContext = nil
         }
         
-        // Initialize other components
-        self.audioBuffer = AudioRingBuffer(sampleRate: AudioProcessor.requiredSampleRate)
-        self.stateManager = StreamingStateManager()
-        self.processingTaskHolder = ProcessingTaskHolder()
+        // Initialize state
+        self.state = BetaStreamingState(configuration: configuration)
         
         // Create the async stream for segments
-        var continuation: AsyncThrowingStream<TranscriptionSegment, Error>.Continuation!
+        var continuation: AsyncThrowingStream<StreamingSegment, Error>.Continuation!
         self.segments = AsyncThrowingStream { cont in
             continuation = cont
         }
@@ -190,25 +254,16 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
     ///
     /// - Throws: `WhisperError.invalidState` if already started.
     public func start() async throws {
-        let currentState = await stateManager.state
-        guard currentState == .idle else {
-            throw WhisperError.invalidState(
-                expected: "idle",
-                actual: currentState.description
-            )
+        guard await state.tryStart() else {
+            throw WhisperError.invalidState(expected: "idle", actual: "already running")
         }
         
-        await stateManager.setState(.running)
-        await stateManager.clearHistory()
-        await audioBuffer.reset()
-
-        
-        // Get the input format and calculate buffer size based on hardware sample rate
-        let format = self.inputNode.outputFormat(forBus: 0)
+        // Get the input format and calculate buffer size
+        let format = inputNode.outputFormat(forBus: 0)
         let bufferSize = AVAudioFrameCount(format.sampleRate * configuration.bufferDuration)
         
         // Install the tap
-        self.inputNode.installTap(
+        inputNode.installTap(
             onBus: 0,
             bufferSize: bufferSize,
             format: format
@@ -216,13 +271,10 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
             guard let self = self else { return }
             
             // Convert samples synchronously before crossing async boundary
-            // AVAudioPCMBuffer is not Sendable, so we must extract the data here
             do {
                 let samples = try AudioProcessor.convert(buffer, sampleRate: format.sampleRate)
                 Task { [weak self] in
-                    guard let self = self else { return }
-                    
-                    await self.appendSamples(samples)
+                    await self?.state.appendSamples(samples)
                 }
             } catch {
                 // Audio conversion error - skip this buffer
@@ -230,282 +282,349 @@ public final class BetaStreamingTranscriber: @unchecked Sendable {
         }
         
         // Start the processing loop
-        let task = Task { [weak self] in
-            guard let self = self else { return }
-            await self.processingLoop()
+        Task { [weak self] in
+            await self?.processingLoop()
         }
-        
-        await processingTaskHolder.setTask(task)
     }
     
     /// Stops the streaming transcription session.
     ///
     /// Removes the tap from the input node and processes any remaining audio.
     ///
-    /// - Returns: The complete transcription result from the final processing.
+    /// - Returns: The final transcribed text from the session.
     /// - Throws: `WhisperError.invalidState` if not running.
     @discardableResult
-    public func stop() async throws -> TranscriptionResult {
-        let currentState = await stateManager.state
-        guard currentState == .running else {
-            throw WhisperError.invalidState(
-                expected: "running",
-                actual: currentState.description
-            )
+    public func stop() async throws -> String {
+        guard await state.tryStop() else {
+            throw WhisperError.invalidState(expected: "running", actual: "not running")
         }
-        
-        await stateManager.setState(.stopping)
         
         // Remove the tap
-        self.inputNode.removeTap(onBus: 0)
-        
-        // Cancel processing task
-        await processingTaskHolder.cancel()
+        inputNode.removeTap(onBus: 0)
         
         // Process any remaining audio
-        let result = try await processFinalAudio()
+        let finalText = try await processFinalAudio()
         
-        await stateManager.setState(.stopped)
+        await state.finish()
         segmentContinuation.finish()
         
-        return result
+        return finalText
     }
     
-    /// The current state of the transcriber.
-    public var state: StreamingState {
+    /// Whether the transcriber is currently running.
+    public var isRunning: Bool {
         get async {
-            await stateManager.state
+            await state.isRunning
         }
     }
     
-    // MARK: - Private Methods
+    // MARK: - Processing Loop
     
-    /// Appends samples to the audio buffer if currently running.
-    private func appendSamples(_ samples: [Float]) async {
-        let currentState = await stateManager.state
-        guard currentState == .running else { return }
-        await audioBuffer.append(samples)
+    /// Main processing loop that handles transcription timing.
+    private func processingLoop() async {
+        if let vadContext = vadContext {
+            await vadProcessingLoop(vad: vadContext)
+        } else {
+            await slidingWindowProcessingLoop()
+        }
     }
     
-    /// Main processing loop that checks for transcription opportunities.
-    private func processingLoop() async {
-        while await stateManager.state == .running {
-            // Check buffer duration
-            let duration = await audioBuffer.duration
+    /// Processing loop for sliding window mode (like whisper.cpp stream default).
+    private func slidingWindowProcessingLoop() async {
+        let stepSamples = Int(configuration.stepDuration * AudioProcessor.requiredSampleRate)
+        
+        while await state.isRunning {
+            // Wait until we have enough new samples
+            let newSampleCount = await state.newSampleCount
             
-            if duration >= configuration.minAudioDuration {
+            if newSampleCount >= stepSamples {
                 do {
-                    try await attemptTranscription()
+                    try await processWindow()
                 } catch {
-                    // Set failed state and emit error
-                    await stateManager.setState(.failed(error as? WhisperError ?? .transcriptionFailed(error.localizedDescription)))
+                    await state.setError(error)
                     segmentContinuation.finish(throwing: error)
                     return
                 }
+            } else {
+                // Small delay to avoid busy waiting
+                try? await Task.sleep(for: .milliseconds(10))
             }
-            
-            // Small delay to avoid busy waiting
-            try? await Task.sleep(for: .milliseconds(100)) // 100ms
         }
     }
     
-    /// Attempts to transcribe the current buffer contents.
-    private func attemptTranscription() async throws {
-        let samples = await audioBuffer.currentSamples
-        guard !samples.isEmpty else { return }
+    /// Processing loop for VAD mode (like whisper.cpp stream with VAD).
+    /// Uses neural Silero VAD for accurate speech detection.
+    private func vadProcessingLoop(vad: VADContext) async {
+        let checkIntervalMs: UInt64 = 100
+        let minSpeechSamples = Int(configuration.vadOptions.minSpeechDurationMs) * Int(AudioProcessor.requiredSampleRate) / 1000
         
-        // If VAD is available, use neural VAD for speech detection
-        if let vad = vadContext {
-            try await transcribeWithVAD(samples: samples, vad: vad)
-        } else {
-            // Use lightweight silence detection for chunking
-            try await transcribeWithSilenceDetection(samples: samples)
-        }
-    }
-    
-    /// Transcribes audio using VAD to detect speech segments.
-    private func transcribeWithVAD(samples: [Float], vad: VADContext) async throws {
-        // Get speech segments from VAD
-        let speechSegments = try await vad.getSpeechSegments(
-            samples: samples,
-            options: configuration.vadOptions
-        )
-        
-        guard !speechSegments.isEmpty else {
-            // No speech detected, keep accumulating
-            return
-        }
-        
-        // Process each complete speech segment
-        for segment in speechSegments {
-            // Calculate sample indices
-            let startSample = Int(segment.startTime * Float(AudioProcessor.requiredSampleRate))
-            let endSample = Int(segment.endTime * Float(AudioProcessor.requiredSampleRate))
+        while await state.isRunning {
+            // Check for speech periodically
+            try? await Task.sleep(for: .milliseconds(checkIntervalMs))
             
-            guard startSample < samples.count && startSample < endSample else { continue }
+            let samples = await state.getAllSamples()
+            guard samples.count >= minSpeechSamples else { continue }
             
-            let segmentSamples = Array(samples[startSample..<min(endSample, samples.count)])
-            
-            // Transcribe this segment
-            let rawSegments = try await whisperContext.transcribe(
-                samples: segmentSamples,
-                options: configuration.transcriptionOptions
-            )
-            
-            // Emit each transcribed segment
-            for rawSegment in rawSegments {
-                let transcriptionSegment = TranscriptionSegment(from: rawSegment)
-                // Only emit if not a duplicate
-                if await stateManager.shouldEmit(text: transcriptionSegment.text) {
-                    segmentContinuation.yield(transcriptionSegment)
-                }
-            }
-        }
-        
-        // Consume the processed audio up to the last segment end
-        if let lastSegment = speechSegments.last {
-            let consumeCount = Int(lastSegment.endTime * Float(AudioProcessor.requiredSampleRate))
-            _ = await audioBuffer.consume(consumeCount)
-        }
-    }
-    
-    /// Transcribes audio using lightweight silence detection for chunking.
-    private func transcribeWithSilenceDetection(samples: [Float]) async throws {
-        let duration = Double(samples.count) / AudioProcessor.requiredSampleRate
-        
-        // Check if audio contains speech
-        guard SilenceDetector.containsSpeech(
-            in: samples,
-            threshold: configuration.silenceDetectorOptions.threshold
-        ) else {
-            // No speech detected - if we have too much silence, clear the buffer
-            if duration > configuration.maxAudioDuration {
-                _ = await audioBuffer.consumeAll()
-            }
-            return
-        }
-        
-        // If we haven't reached max duration, look for a silence break point
-        if duration < configuration.maxAudioDuration {
-            // Try to find a good break point in the audio
-            if let breakPoint = SilenceDetector.findSilenceBreak(
-                in: samples,
-                options: configuration.silenceDetectorOptions
-            ) {
-                // We found a silence gap - transcribe up to that point
-                let chunkSamples = Array(samples[..<breakPoint])
-                try await transcribeChunk(chunkSamples)
+            // Use neural VAD to detect speech segments
+            do {
+                let speechSegments = try await vad.getSpeechSegments(
+                    samples: samples,
+                    options: configuration.vadOptions
+                )
                 
-                // Consume the processed audio
-                _ = await audioBuffer.consume(breakPoint)
+                guard !speechSegments.isEmpty else { continue }
+                
+                // Process each detected speech segment
+                for segment in speechSegments {
+                    let startSample = Int(segment.startTime * Float(AudioProcessor.requiredSampleRate))
+                    let endSample = Int(segment.endTime * Float(AudioProcessor.requiredSampleRate))
+                    
+                    guard startSample < samples.count && startSample < endSample else { continue }
+                    
+                    let segmentSamples = Array(samples[startSample..<min(endSample, samples.count)])
+                    
+                    guard !segmentSamples.isEmpty else { continue }
+                    
+                    try await transcribeAndEmit(samples: segmentSamples, isPartial: false)
+                }
+                
+                // Consume processed audio up to the last segment end
+                if let lastSegment = speechSegments.last {
+                    let consumeCount = Int(lastSegment.endTime * Float(AudioProcessor.requiredSampleRate))
+                    await state.consumeSamples(count: consumeCount)
+                }
+            } catch {
+                await state.setError(error)
+                segmentContinuation.finish(throwing: error)
+                return
             }
-            // If no break point found, keep accumulating
-        } else {
-            // Max duration reached - force transcription
-            // Find best break point, or use entire buffer
-            let breakPoint = SilenceDetector.findSilenceBreak(
-                in: samples,
-                options: configuration.silenceDetectorOptions
-            ) ?? samples.count
-            
-            let chunkSamples = Array(samples[..<breakPoint])
-            try await transcribeChunk(chunkSamples)
-            
-            // Consume processed audio, keeping minimal overlap
-            let overlapSamples = Int(0.1 * AudioProcessor.requiredSampleRate)
-            let consumeCount = max(0, breakPoint - overlapSamples)
-            _ = await audioBuffer.consume(consumeCount)
         }
     }
     
-    /// Transcribes a chunk of audio and emits segments.
-    private func transcribeChunk(_ samples: [Float]) async throws {
-        guard !samples.isEmpty else { return }
+    /// Process a single window in sliding window mode.
+    private func processWindow() async throws {
+        let windowSamples = Int(configuration.windowDuration * AudioProcessor.requiredSampleRate)
+        let keepSamples = Int(configuration.keepDuration * AudioProcessor.requiredSampleRate)
         
+        // Get new samples and combine with kept samples from previous iteration
+        let newSamples = await state.consumeNewSamples()
+        let keptSamples = await state.getKeptSamples()
+        
+        // Build the full window: [kept samples from previous] + [new samples]
+        var windowBuffer = keptSamples + newSamples
+        
+        // Trim to window size if needed
+        if windowBuffer.count > windowSamples {
+            windowBuffer = Array(windowBuffer.suffix(windowSamples))
+        }
+        
+        guard !windowBuffer.isEmpty else { return }
+        
+        // Transcribe the window
+        try await transcribeAndEmit(samples: windowBuffer, isPartial: true)
+        
+        // Keep audio for next iteration to avoid word boundary issues
+        if windowBuffer.count > keepSamples {
+            let toKeep = Array(windowBuffer.suffix(keepSamples))
+            await state.setKeptSamples(toKeep)
+        }
+    }
+    
+    /// Transcribes samples and emits segments.
+    private func transcribeAndEmit(samples: [Float], isPartial: Bool) async throws {
+        // Build transcription options for streaming
+        var options = configuration.transcriptionOptions
+        
+        // In sliding window mode (isPartial=true), use single segment for cleaner output
+        if isPartial {
+            options.singleSegment = true
+        }
+        
+        // Set max tokens
+        if configuration.maxTokens > 0 {
+            options.maxTokens = configuration.maxTokens
+        }
+        
+        // Use prompt tokens from previous iteration if keeping context
+        if configuration.keepContext {
+            let promptTokens = await state.getPromptTokens()
+            if !promptTokens.isEmpty {
+                // Note: This would require extending TranscriptionOptions to support prompt tokens
+                // For now, we use the initial prompt as a text hint
+            }
+        }
+        
+        // Transcribe
         let rawSegments = try await whisperContext.transcribe(
             samples: samples,
-            options: configuration.transcriptionOptions
+            options: options
         )
         
-        for rawSegment in rawSegments {
-            let transcriptionSegment = TranscriptionSegment(from: rawSegment)
-            // Only emit if not a duplicate
-            if await stateManager.shouldEmit(text: transcriptionSegment.text) {
-                segmentContinuation.yield(transcriptionSegment)
-            }
+        let iteration = await state.incrementIteration()
+        
+        // Combine all segment text
+        let fullText = rawSegments.map { $0.text }.joined()
+        
+        guard !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        
+        // Emit segment
+        let segment = StreamingSegment(
+            text: fullText,
+            isPartial: isPartial,
+            iteration: iteration
+        )
+        segmentContinuation.yield(segment)
+        
+        // Store tokens for context continuity if enabled
+        if configuration.keepContext {
+            let tokens = rawSegments.flatMap { $0.tokens ?? [] }.map { Int32($0.id) }
+            await state.setPromptTokens(tokens)
         }
     }
     
     /// Processes any remaining audio when stopping.
-    private func processFinalAudio() async throws -> TranscriptionResult {
-        var samples = await audioBuffer.consumeAll()
+    private func processFinalAudio() async throws -> String {
+        let allSamples = await state.getAllSamples()
         
-        guard !samples.isEmpty else {
-            return TranscriptionResult(
-                segments: [],
-                detectedLanguage: nil,
-                timings: nil
-            )
-        }
+        guard !allSamples.isEmpty else { return "" }
         
-        // Pad to minimum length if needed (whisper.cpp requires >= 100ms)
-        samples = AudioProcessor.padToMinimumLength(samples)
+        // Pad to minimum length if needed
+        let paddedSamples = AudioProcessor.padToMinimumLength(allSamples)
         
-        // Transcribe remaining audio
+        // Transcribe with full options (not streaming mode)
         let rawSegments = try await whisperContext.transcribe(
-            samples: samples,
+            samples: paddedSamples,
             options: configuration.transcriptionOptions
         )
         
-        // Emit final segments
-        for rawSegment in rawSegments {
-            let transcriptionSegment = TranscriptionSegment(from: rawSegment)
-            // Only emit if not a duplicate
-            if await stateManager.shouldEmit(text: transcriptionSegment.text) {
-                segmentContinuation.yield(transcriptionSegment)
-            }
+        let fullText = rawSegments.map { $0.text }.joined()
+        
+        if !fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
+            let iteration = await state.incrementIteration()
+            let segment = StreamingSegment(
+                text: fullText,
+                isPartial: false,
+                iteration: iteration
+            )
+            segmentContinuation.yield(segment)
         }
         
-        // Get detected language
-        let detectedLanguage = await getDetectedLanguage()
-        let timings = await whisperContext.getTimings()
-        
-        return TranscriptionResult(
-            segments: rawSegments,
-            detectedLanguage: detectedLanguage,
-            timings: timings
-        )
-    }
-    
-    /// Gets the detected language from the context if auto-detection was used.
-    private func getDetectedLanguage() async -> Language? {
-        let options = configuration.transcriptionOptions
-        guard options.language == nil || options.language == .auto else {
-            return nil
-        }
-        
-        let langId = await whisperContext.detectedLanguageId
-        guard langId >= 0,
-              let langString = await whisperContext.languageString(for: langId) else {
-            return nil
-        }
-        
-        return Language(rawValue: langString)
+        return fullText
     }
 }
 
-// MARK: - Processing Task Holder
+// MARK: - Streaming State Actor
 
-/// Actor to hold the processing task reference.
-private actor ProcessingTaskHolder {
-    private var task: Task<Void, Never>?
+/// Actor managing the streaming transcription state.
+private actor BetaStreamingState {
+    private let configuration: BetaStreamingTranscriber.Configuration
     
-    func setTask(_ task: Task<Void, Never>) {
-        self.task = task
+    // Lifecycle state
+    private var running = false
+    private var finished = false
+    private var error: Error?
+    
+    // Audio buffers
+    private var newSamples: [Float] = []  // New samples since last processing
+    private var keptSamples: [Float] = [] // Samples kept from previous iteration
+    private var allSamples: [Float] = []  // All samples for final processing
+    
+    // Context
+    private var promptTokens: [Int32] = []
+    private var iteration = 0
+    
+    init(configuration: BetaStreamingTranscriber.Configuration) {
+        self.configuration = configuration
     }
     
-    func cancel() {
-        task?.cancel()
-        task = nil
+    // MARK: - Lifecycle
+    
+    var isRunning: Bool { running && !finished }
+    
+    func tryStart() -> Bool {
+        guard !running && !finished else { return false }
+        running = true
+        return true
+    }
+    
+    func tryStop() -> Bool {
+        guard running && !finished else { return false }
+        running = false
+        return true
+    }
+    
+    func finish() {
+        finished = true
+    }
+    
+    func setError(_ error: Error) {
+        self.error = error
+        running = false
+    }
+    
+    // MARK: - Audio Management
+    
+    func appendSamples(_ samples: [Float]) {
+        newSamples.append(contentsOf: samples)
+        allSamples.append(contentsOf: samples)
+    }
+    
+    var newSampleCount: Int { newSamples.count }
+    
+    func getNewSamples() -> [Float] {
+        return newSamples
+    }
+    
+    func consumeNewSamples() -> [Float] {
+        let samples = newSamples
+        newSamples.removeAll(keepingCapacity: true)
+        return samples
+    }
+    
+    func getSamplesForTranscription(maxCount: Int) -> [Float] {
+        let count = min(allSamples.count, maxCount)
+        return Array(allSamples.suffix(count))
+    }
+    
+    func markProcessed() {
+        newSamples.removeAll(keepingCapacity: true)
+    }
+    
+    func getKeptSamples() -> [Float] {
+        return keptSamples
+    }
+    
+    func setKeptSamples(_ samples: [Float]) {
+        keptSamples = samples
+    }
+    
+    func getAllSamples() -> [Float] {
+        return allSamples
+    }
+    
+    /// Consumes (removes) the specified number of samples from the beginning of allSamples.
+    func consumeSamples(count: Int) {
+        let actualCount = min(count, allSamples.count)
+        allSamples.removeFirst(actualCount)
+        // Also remove from newSamples if they overlap
+        let newCount = min(count, newSamples.count)
+        if newCount > 0 {
+            newSamples.removeFirst(newCount)
+        }
+    }
+    
+    // MARK: - Context
+    
+    func getPromptTokens() -> [Int32] {
+        return promptTokens
+    }
+    
+    func setPromptTokens(_ tokens: [Int32]) {
+        promptTokens = tokens
+    }
+    
+    func incrementIteration() -> Int {
+        iteration += 1
+        return iteration
     }
 }

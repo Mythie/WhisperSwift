@@ -49,11 +49,13 @@ for try await segment in transcriber.segments {
 
 - <doc:GettingStarted>
 - <doc:RealTimeStreaming>
+- <doc:BetaStreaming>
 
 ### Transcription
 
 - ``Transcriber``
 - ``StreamingTranscriber``
+- ``BetaStreamingTranscriber``
 - ``TranscriptionResult``
 - ``TranscriptionSegment``
 

@@ -22,6 +22,23 @@ public struct TranscriptionOptions: Sendable {
     /// Sampling strategy for decoding.
     public var samplingStrategy: SamplingStrategy
     
+    /// Force single segment output (useful for streaming).
+    ///
+    /// When true, the transcription will return at most one segment
+    /// regardless of audio length. Useful for real-time streaming.
+    public var singleSegment: Bool
+    
+    /// Maximum number of tokens per audio chunk.
+    ///
+    /// Set to 0 for no limit. Lower values can speed up transcription
+    /// but may truncate output.
+    public var maxTokens: Int
+    
+    /// Whether to print timestamps in the output.
+    ///
+    /// When false, timestamps are not included in segment output.
+    public var noTimestamps: Bool
+    
     /// Creates transcription options with the specified parameters.
     /// - Parameters:
     ///   - language: The language of the audio. Defaults to `nil` (auto-detect).
@@ -29,18 +46,27 @@ public struct TranscriptionOptions: Sendable {
     ///   - tokenTimestamps: Whether to include token timestamps. Defaults to `false`.
     ///   - initialPrompt: Initial prompt for conditioning. Defaults to `nil`.
     ///   - samplingStrategy: Decoding strategy. Defaults to `.greedy`.
+    ///   - singleSegment: Force single segment output. Defaults to `false`.
+    ///   - maxTokens: Maximum tokens per chunk. Defaults to `0` (no limit).
+    ///   - noTimestamps: Disable timestamps. Defaults to `false`.
     public init(
         language: Language? = nil,
         translate: Bool = false,
         tokenTimestamps: Bool = false,
         initialPrompt: String? = nil,
-        samplingStrategy: SamplingStrategy = .greedy
+        samplingStrategy: SamplingStrategy = .greedy,
+        singleSegment: Bool = false,
+        maxTokens: Int = 0,
+        noTimestamps: Bool = false
     ) {
         self.language = language
         self.translate = translate
         self.tokenTimestamps = tokenTimestamps
         self.initialPrompt = initialPrompt
         self.samplingStrategy = samplingStrategy
+        self.singleSegment = singleSegment
+        self.maxTokens = maxTokens
+        self.noTimestamps = noTimestamps
     }
     
     /// Default options for general transcription.

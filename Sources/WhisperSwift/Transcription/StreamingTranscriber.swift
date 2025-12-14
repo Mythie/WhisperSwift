@@ -101,7 +101,7 @@ public final class StreamingTranscriber: Sendable {
             self.vadContext = try await Task {
                 try VADContext(
                     modelPath: vadPath,
-                    useGPU: configuration.useGPU,
+                    useGPU: false, // Force CPU - Metal crashes with VAD
                     threadCount: Int(configuration.optimalThreadCount)
                 )
             }.value
